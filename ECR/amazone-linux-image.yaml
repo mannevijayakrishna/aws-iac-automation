@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to pull Amazon Linux images from Docker Hub and push them to an existing AWS ECR repository on a scheduled basis using AWS CodeBuild.
+
+Parameters:
+  ExistingECRRepoName:
+    Type: String
+    Description: The name of the existing ECR repository to store Amazon Linux images.
+
+Resources:
+
+  # 1. AWS CodeBuild Project (Using Existing Service Role)
+  AmazonLinuxCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: AmazonLinuxECRSync
+      ServiceRole: arn:aws:iam::482974349603:role/scdhhs-codebuild-mes-service-role
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+      Source:
+        Type: NO_SOURCE
+      TimeoutInMinutes: 10
+      BuildSpec: |
+        version: 0.2
+        phases:
+          pre_build:
+            commands:
+              - echo "Logging into AWS ECR..."
+              - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+          build:
+            commands:
+              - echo "Pulling Amazon Linux images from Docker Hub..."
+              - docker pull amazonlinux:2
+              - docker pull amazonlinux:2023
+              - docker pull amazonlinux:latest
+              - echo "Tagging and pushing images to AWS ECR..."
+              - docker tag amazonlinux:2 ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:2
+              - docker tag amazonlinux:2023 ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:2023
+              - docker tag amazonlinux:latest ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest
+              - docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:2
+              - docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:2023
+              - docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest
+        env:
+          variables:
+            AWS_REGION: !Ref AWS::Region
+            AWS_ACCOUNT_ID: !Ref AWS::AccountId
+            ECR_REPO_NAME: !Ref ExistingECRRepoName
+
+  # 2. EventBridge Rule to Schedule CodeBuild Execution
+  CodeBuildSchedulerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: AmazonLinuxECRSyncSchedule
+      ScheduleExpression: "cron(0 12 * * ? *)"  # Runs every day at 12:00 UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AmazonLinuxCodeBuildProject.Arn
+          Id: "CodeBuildTarget"
+          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
+
+  # 3. IAM Role for EventBridge to Trigger CodeBuild
+  EventBridgeInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EventBridgeCodeBuildInvokeRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeCodeBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - codebuild:StartBuild
+                Resource: !GetAtt AmazonLinuxCodeBuildProject.Arn
+
+Outputs:
+  ECRRepositoryURL:
+    Description: The ECR repository URL where images are stored.
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ExistingECRRepoName}"
